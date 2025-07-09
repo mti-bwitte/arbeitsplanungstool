@@ -1,0 +1,10 @@
+@startuml
+class CADService {
+    select_file()
+    _load_mesh()
+    voxelise()
+        mesh
+    __init__()
+}
+QObject <|-- CADService
+@enduml
