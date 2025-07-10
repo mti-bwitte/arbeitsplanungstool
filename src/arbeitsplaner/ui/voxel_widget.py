@@ -1,4 +1,5 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from PyQt6.QtCore import pyqtSignal
 import numpy as np
 import pyqtgraph.opengl as gl
 
@@ -27,13 +28,26 @@ class VoxelWidget(QWidget):
     parent : QWidget, optional
         Qt parent widget for normal Qt memory management.
         'None' means the widget is a top-level window when shown.
-    camera_distance : float, optional
-        Initial camera distance. If *None*, the distance is automatically
-        set to twice the bounding-box diagonal of the voxel grid.
+    camera_distance : float or None, optional
+        If given, the camera starts at this distance.  
+        Pass ``None`` (default) to place the camera at twice the
+        bounding‑box diagonal **automatically**.
+    surface_only : bool, default False
+        ``True`` → render only the outer surface (Marching‑Cubes),
+        ``False`` → render every filled voxel as a cube.
     """
 
+    # Emits the filled-voxel count each time the mesh is (re)built
+    voxelCountChanged = pyqtSignal(int)
 
-    def __init__(self, voxgrid, parent=None, camera_distance = 100.0):
+    def __init__(
+        self,
+        voxgrid,
+        parent=None,
+        *,
+        camera_distance: float | None = None,
+        surface_only: bool = False,
+    ):
         
         """
         Construct the widget, create an internal `GLViewWidget`, build a
@@ -56,9 +70,23 @@ class VoxelWidget(QWidget):
 
         # Würfel-Mesh aus VoxelGrid
 
-        cube_mesh = voxgrid.as_boxes()
-        vertices  = np.asarray(cube_mesh.vertices, dtype=float)
-        faces     = np.asarray(cube_mesh.faces, dtype=int)
+        if surface_only:
+            #Render only the outer surface - far fewer triangles
+            surface_mesh = voxgrid.marching_cubes
+            vertices = surface_mesh.vertices.astype(float)
+            faces = surface_mesh.faces.astype(int)
+        else:
+            cube_mesh = voxgrid.as_boxes()
+            vertices  = np.asarray(cube_mesh.vertices, dtype=float)
+            faces     = np.asarray(cube_mesh.faces, dtype=int)
+
+        # choose the mesh whose bb we use for auto camera distance
+        mesh_for_extent = surface_mesh if surface_only else cube_mesh
+
+        # Emit voxel count
+        voxel_count = int(len(voxgrid.points))
+        self.voxel_count = voxel_count
+        self.voxelCountChanged.emit(voxel_count)
 
         mesh_data  = gl.MeshData(vertexes=vertices, faces=faces)
         mesh_item  = gl.GLMeshItem(meshdata=mesh_data, smooth=False,
@@ -67,8 +95,8 @@ class VoxelWidget(QWidget):
 
         # Kameraposition
 
-        auto_distance      = np.linalg.norm(cube_mesh.extents) * 2
-        self.default_distance = camera_distance or auto_distance
+        auto_distance      = np.linalg.norm(mesh_for_extent.extents) * 2
+        self.default_distance = camera_distance if camera_distance is not None else auto_distance
         self.gl_view.setCameraPosition(distance=self.default_distance)
 
     # -------------------------------------------------------------
