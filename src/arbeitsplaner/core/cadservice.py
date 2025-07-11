@@ -1,6 +1,7 @@
 from pathlib import Path
 import trimesh
 import os
+import numpy as np
 
 from PyQt6.QtCore import (
     QObject,
@@ -42,6 +43,7 @@ class CADService(QObject):
 
     meshReady = pyqtSignal(trimesh.Trimesh)
     voxelReady = pyqtSignal(object)
+    voxeliserUsed = pyqtSignal(str)
     
     def select_file(self):
 
@@ -97,37 +99,99 @@ class CADService(QObject):
         else:
             # ----------------------------------------------------------------
             # Fallback: run in the global QThreadPool via a small QRunnable
+            # that simply delegates to the existing _voxelise_sync function.
             # ----------------------------------------------------------------
             class _VoxelJob(QRunnable):
-                def __init__(self, m, p, sig):
+                """
+                Lightweight wrapper so we can execute `self._voxelise_sync`
+                inside the QThreadPool when QtConcurrent is unavailable.
+                """
+
+                def __init__(self, fn, m, p):
                     super().__init__()
+                    self.fn = fn      # reference to _voxelise_sync
                     self.mesh = m
                     self.pitch = p
-                    self.sig = sig
                     self.setAutoDelete(True)
 
                 def run(self) -> None:
-                    vox = self.mesh.voxelized(self.pitch)
-                    self.sig.emit(vox)
+                    # Call the sync voxeliser; it will emit `voxelReady`
+                    # when finished.  Runs in this worker thread.
+                    self.fn(self.mesh, self.pitch)
 
-            _POOL.start(_VoxelJob(mesh, pitch, self.voxelReady))
+            _POOL.start(_VoxelJob(self._voxelise_sync, mesh, pitch))
 
 
+    #def _voxelise_sync(self, mesh: trimesh.Trimesh, pitch: float) -> None:
+    #    """
+    #    input:
+    #        mesh  : trimesh.Trimesh
+    #        pitch : float
+    #    output:
+    #        none – emits ``voxelReady`` (trimesh.voxel.VoxelGrid)
+
+    #    CPU‑bound, multi‑threaded voxelisation executed in a background thread.
+    #    The resulting VoxelGrid is sent back to the GUI thread via
+    #    the thread‑safe Qt signal.
+    #    """
+
+        #voxgrid = mesh.voxelized(
+        #    pitch,
+        #    method="ray",          
+        #    max_threads=os.cpu_count()   # use all CPU cores
+        #).fill()
+        #self.voxelReady.emit(voxgrid)
+
+    # NOTE: This method is safe to call from *any* worker thread,
+    # either via QtConcurrent or the fallback QRunnable above.
     def _voxelise_sync(self, mesh: trimesh.Trimesh, pitch: float) -> None:
         """
-        input:
-            mesh  : trimesh.Trimesh
-            pitch : float
-        output:
-            none – emits ``voxelReady`` (trimesh.voxel.VoxelGrid)
-
-        CPU‑bound, multi‑threaded voxelisation executed in a background thread.
-        The resulting VoxelGrid is sent back to the GUI thread via
-        the thread‑safe Qt signal.
+        Open3D-based voxelisation on Metal or CPU, then emit VoxelGrid.
         """
-        voxgrid = mesh.voxelized(
-            pitch,
-            method="binvox",          # robust for non‑watertight meshes
-            max_threads=os.cpu_count()   # use all CPU cores
+        import open3d as o3d
+        import numpy as np
+
+        # ------- 1. Trimesh  ->  Open3D legacy mesh ----------------------------
+        # Open3D's stable (legacy) API offers create_from_triangle_mesh(),
+        # which works on both CPU and Metal.  We convert the trimesh arrays
+        # to Open3D utility vectors.
+        o3d_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(mesh.vertices),
+            o3d.utility.Vector3iVector(mesh.faces.astype(np.int32)),
         )
+
+        # ------- 2. Voxelisation ----------------------------------------------
+        # create_from_triangle_mesh fills each intersected voxel (surface‑
+        # carving).  It is CPU‑only but already much faster than trimesh's
+        # subdivide.  For watertight meshes we later run a fill() to close
+        # cavities.
+        o3d_voxgrid = o3d.geometry.VoxelGrid.create_from_triangle_mesh(
+            o3d_mesh, voxel_size=float(pitch)
+        )
+        self.voxeliserUsed.emit("Open3D CPU")
+
+        # ------- 3. Convert to dense bool array -------------------------------
+        # Open3D stores only filled voxels (sparse).  We reconstruct a dense
+        # occupancy grid so that trimesh.VoxelGrid can be used unchanged.
+
+        indices = np.asarray([v.grid_index for v in o3d_voxgrid.get_voxels()])
+        if indices.size == 0:
+            dense = np.zeros((1, 1, 1), dtype=bool)
+        else:
+            dims = indices.max(axis=0) + 1          # (nx, ny, nz)
+            dense = np.zeros(dims, dtype=bool)
+            dense[indices[:, 0], indices[:, 1], indices[:, 2]] = True
+
+        # optional: close internal cavities
+        from scipy.ndimage import binary_fill_holes
+
+        dense = binary_fill_holes(dense)
+
+        # ------- 4. zurück zu Trimesh-VoxelGrid ------------------------------
+        # Build a 4×4 transform whose diagonal encodes the voxel pitch
+        transform = np.eye(4)
+        transform[0, 0] = transform[1, 1] = transform[2, 2] = float(pitch)
+
+        voxgrid = trimesh.voxel.VoxelGrid(dense, transform=transform)
+
         self.voxelReady.emit(voxgrid)

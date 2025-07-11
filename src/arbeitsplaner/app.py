@@ -5,6 +5,6 @@ from ui.main_window import MainWindow
 
 app = QApplication([sys.argv])
 window = MainWindow()
-window.setMinimumSize(300,400)
+window.setMinimumSize(600,800)
 window.show()
 app.exec()

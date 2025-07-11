@@ -74,10 +74,18 @@ class MainWindow(QMainWindow):
         self._vis_timer.timeout.connect(self._update_visualisation_time)
         self._vis_start = None
 
+        self.whichvoxelizerused_label = QLabel("Voxelizer used: None")
+        self.statusBar().addPermanentWidget(self.whichvoxelizerused_label)
+
         # Service signals -> slots
         self.service.meshReady.connect(
             lambda m: self.service.voxelise(m, pitch=1.0))
         self.service.voxelReady.connect(self._show_voxels)
+        self.service.voxeliserUsed.connect(
+            lambda displaytext: self.whichvoxelizerused_label.setText(
+                f"Voxelizer used: {displaytext}"
+            )
+        )
 
     # -- Slots ----------------------------------------------------- #
 
