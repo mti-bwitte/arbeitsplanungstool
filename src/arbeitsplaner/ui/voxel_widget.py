@@ -2,6 +2,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtCore import pyqtSignal
 import numpy as np
 import pyqtgraph.opengl as gl
+from pyqtgraph.opengl import GLAxisItem, GLGridItem
 
 class VoxelWidget(QWidget):
     
@@ -92,6 +93,32 @@ class VoxelWidget(QWidget):
         mesh_item  = gl.GLMeshItem(meshdata=mesh_data, smooth=False,
                                    shader="shaded", glOptions="opaque")
         self.gl_view.addItem(mesh_item)
+
+        # -------------------------------------------------------------
+        # Coordinate system
+        # -------------------------------------------------------------
+        axis = GLAxisItem()
+        # Scale axis to match the bounding box of the voxel mesh
+        axis.setSize(
+            x=float(mesh_for_extent.extents[0]),
+            y=float(mesh_for_extent.extents[1]),
+            z=float(mesh_for_extent.extents[2]),
+        )
+        self.gl_view.addItem(axis)
+
+        # Optional: ground grid (XZ‑plane) for orientation
+        grid = GLGridItem()
+        grid.setSize(
+            mesh_for_extent.extents[0],
+            mesh_for_extent.extents[2],
+        )
+        grid.setSpacing(1, 1)  # visual spacing; adjust as needed
+        grid.translate(
+            -mesh_for_extent.extents[0] / 2,
+            -mesh_for_extent.extents[2] / 2,
+            -mesh_for_extent.extents[1] / 2,
+        )
+        self.gl_view.addItem(grid)
 
         # Kameraposition
 

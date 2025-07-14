@@ -144,9 +144,11 @@ class MainWindow(QMainWindow):
             pitch=self.pitch_spin.value()
         )
 
-    # voxelisation itmer
+    # voxelisation timer
     def _start_voxelisation_timer(self):
         self._vxl_start = time.perf_counter()
+        # reset visualisation label for the new run
+        self.visualisation_label.setText("Visualisation: idle")
         self.voxelisation_label.setText("Voxelisation in progress: 0.0 s")
         if not self._vxl_timer.isActive():
             self._vxl_timer.start()
@@ -154,6 +156,9 @@ class MainWindow(QMainWindow):
     def _update_voxelisation_time(self):
         if self._vxl_start is None: return
         elapsed = time.perf_counter() - self._vxl_start
+        self.visualisation_label.setText(
+            "Visualisation: idle"
+        )
         self.voxelisation_label.setText(
             f"Voxelisation in progress: {elapsed:.1f} s"
         )

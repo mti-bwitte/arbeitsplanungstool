@@ -18,8 +18,6 @@ except ImportError:  # QtConcurrent not shipped in some distro builds
     _HAVE_CONCURRENT = False
     _POOL = QThreadPool.globalInstance()
 
-from PyQt6.QtWidgets import QFileDialog
-
 class CADService(QObject):
 
     """
@@ -44,23 +42,32 @@ class CADService(QObject):
     meshReady = pyqtSignal(trimesh.Trimesh)
     voxelReady = pyqtSignal(object)
     voxeliserUsed = pyqtSignal(str)
+
+    def __init__(self, parent: QObject | None = None):
+        """
+        input:
+            parent : QObject | None – optional Qt parent for normal
+                     ownership / auto‑deletion.  Pass None for a
+                     top‑level service object.
+
+        output:
+            none
+        """
+        super().__init__(parent)
     
     def select_file(self):
 
-        """
-        input:
-            none – opens a modal file dialog
-        output:
-            none – the method returns immediately; if the user selects a
-            file, ``meshReady`` is emitted with *trimesh.Trimesh*.
+        from PyQt6.QtWidgets import QFileDialog
 
-        Presents a native file dialog and loads an STL / STEP file chosen
-        by the user.
-        """
-
-        path, _ = QFileDialog.getOpenFileName(None, "Datei auswählen", "", "CAD-Dateien (*.stl *.step *.stp)")
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Datei auswählen",
+            "",
+            "CAD-Dateien (*.stl *.step *.stp)",
+        )
         if not path:
             return
+
         self._load_mesh(Path(path))
 
     def _load_mesh(self, path:Path):
@@ -121,32 +128,29 @@ class CADService(QObject):
 
             _POOL.start(_VoxelJob(self._voxelise_sync, mesh, pitch))
 
-
-    #def _voxelise_sync(self, mesh: trimesh.Trimesh, pitch: float) -> None:
-    #    """
-    #    input:
-    #        mesh  : trimesh.Trimesh
-    #        pitch : float
-    #    output:
-    #        none – emits ``voxelReady`` (trimesh.voxel.VoxelGrid)
-
-    #    CPU‑bound, multi‑threaded voxelisation executed in a background thread.
-    #    The resulting VoxelGrid is sent back to the GUI thread via
-    #    the thread‑safe Qt signal.
-    #    """
-
-        #voxgrid = mesh.voxelized(
-        #    pitch,
-        #    method="ray",          
-        #    max_threads=os.cpu_count()   # use all CPU cores
-        #).fill()
-        #self.voxelReady.emit(voxgrid)
-
-    # NOTE: This method is safe to call from *any* worker thread,
-    # either via QtConcurrent or the fallback QRunnable above.
     def _voxelise_sync(self, mesh: trimesh.Trimesh, pitch: float) -> None:
         """
-        Open3D-based voxelisation on Metal or CPU, then emit VoxelGrid.
+        Perform the heavy, blocking voxelisation work.
+
+        input:
+            mesh   : trimesh.Trimesh  – triangle soup to convert
+            pitch  : float            – voxel edge length (same unit as mesh)
+
+        output:
+            none – the resulting ``trimesh.voxel.VoxelGrid`` is delivered
+            asynchronously via the ``voxelReady`` signal.
+
+        Details
+        -------
+        1. Converts *mesh* to an Open3D legacy ``TriangleMesh``.
+        2. Calls ``VoxelGrid.create_from_triangle_mesh`` (CPU‑surface carving).
+        3. Builds a dense boolean occupancy tensor and fills internal cavities.
+        4. Wraps the tensor in a ``trimesh.voxel.VoxelGrid`` whose scaling
+           is stored in the 4×4 ``transform`` matrix (diagonal = *pitch*).
+        5. Emits the result back to the GUI thread.
+
+        Runs inside a worker thread (either QtConcurrent or QRunnable), so
+        the GUI thread remains responsive.
         """
         import open3d as o3d
         import numpy as np
@@ -185,7 +189,7 @@ class CADService(QObject):
         # optional: close internal cavities
         from scipy.ndimage import binary_fill_holes
 
-        dense = binary_fill_holes(dense)
+        dense = binary_fill_holes(dense)            # 3D-NumPy-Array with boolean values
 
         # ------- 4. zurück zu Trimesh-VoxelGrid ------------------------------
         # Build a 4×4 transform whose diagonal encodes the voxel pitch
