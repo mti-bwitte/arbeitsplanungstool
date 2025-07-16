@@ -14,11 +14,13 @@ All UI elements are wired via Qt's signal/slot mechanism – no polling.
 """
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QToolBar, QPushButton, QDoubleSpinBox, QLabel
+    QMainWindow, QToolBar, QPushButton, QDoubleSpinBox,
+    QLabel, QComboBox
 )
 from PyQt6.QtCore import QTimer
 import time
-from core.cadservice import CADService
+
+from core.cadservice import CADService, Component
 from ui.voxel_widget import VoxelWidget
 
 class MainWindow(QMainWindow):
@@ -39,10 +41,16 @@ class MainWindow(QMainWindow):
         ## Toolbar with load / pitch / update
         toolbar = QToolBar(self.tr("Main Tools")); self.addToolBar(toolbar)
 
-        # Loading button to load a file
-        load_button = QPushButton("Load File")
-        toolbar.addWidget(load_button)
-        load_button.clicked.connect(self.service.select_file)
+        # Component selector (Workpiece / Fixture / Tool)
+        self.comp_combo = QComboBox()
+        self.comp_combo.addItems(["Workpiece", "Fixture", "Tool"])
+        toolbar.addWidget(self.comp_combo)
+        self.comp_combo.currentIndexChanged.connect(self._update_voxel_button_state)
+
+        # Load CAD button
+        self.load_button = QPushButton("Load CAD")
+        toolbar.addWidget(self.load_button)
+        self.load_button.clicked.connect(self._on_load_clicked)
 
         # Pitch input to change voxel edge length
         self.pitch_spin = QDoubleSpinBox(value=1.0, minimum=0.1, singleStep=0.1)
@@ -50,11 +58,11 @@ class MainWindow(QMainWindow):
         self.pitch_spin.setSuffix(" mm")
         self.pitch_spin.setEnabled(False) # gets enabled after first load
 
-        # Update button to update pitch
-        self.update_button = QPushButton("Update")
-        toolbar.addWidget(self.update_button)
-        self.update_button.clicked.connect(self._on_update_clicked)
-        self.update_button.setEnabled(False)
+        # Voxelise button
+        self.voxel_button = QPushButton("Update")
+        toolbar.addWidget(self.voxel_button)
+        self.voxel_button.clicked.connect(self._on_voxel_clicked)
+        self.voxel_button.setEnabled(False)  # enabled after first mesh
 
         # Voxel counter in the status bar
         self.voxel_label = QLabel("Voxel: 0")
@@ -77,30 +85,65 @@ class MainWindow(QMainWindow):
         self.whichvoxelizerused_label = QLabel("Voxelizer used: None")
         self.statusBar().addPermanentWidget(self.whichvoxelizerused_label)
 
-        # Service signals -> slots
-        self.service.meshReady.connect(
-            lambda m: self.service.voxelise(m, pitch=1.0))
-        self.service.voxelReady.connect(self._show_voxels)
-        self.service.voxeliserUsed.connect(
-            lambda displaytext: self.whichvoxelizerused_label.setText(
-                f"Voxelizer used: {displaytext}"
+        # Service signals -> slots with component enum
+        self.service.meshReady.connect(self._on_mesh_ready)
+        self.service.voxelReady.connect(self._on_voxel_ready)
+
+    # ------------------------------------------------------------------
+    def _selected_component(self) -> Component:
+        idx = self.comp_combo.currentIndex()
+        return [Component.WORKPIECE, Component.FIXTURE, Component.TOOL][idx]
+
+    # ------------------------------------------------------------------
+    def _update_voxel_button_state(self) -> None:
+        """
+        Enable the Voxelise‑button only when the Workpiece is selected
+        *and* a Workpiece mesh is already loaded.
+        """
+        comp = self._selected_component()
+        wp_mesh_loaded = self.service.components[Component.WORKPIECE].mesh is not None
+        self.voxel_button.setEnabled(comp is Component.WORKPIECE and wp_mesh_loaded)
+
+    # -- Button handlers ---------------------------------------------- #
+    def _on_load_clicked(self):
+        comp = self._selected_component()
+        self.service.select_file(comp)
+
+    def _on_voxel_clicked(self):
+        comp = self._selected_component()
+        self._start_voxelisation_timer()
+        self.service.voxelise(comp, pitch=self.pitch_spin.value())
+
+    # -- Service signal handlers -------------------------------------- #
+    def _on_mesh_ready(self, comp: Component):
+        """Viewer update when a mesh is loaded."""
+        mesh = self.service.components[comp].mesh
+        if self._viewer is None:
+            # first time: create an empty viewer (no heavy preprocessing)
+            self._viewer = VoxelWidget(None)
+            self.setCentralWidget(self._viewer)
+
+        self._viewer.update_component(comp, mesh=mesh)
+        # -------------------------------------------------------------
+        # Auto‑voxelise Workpiece right after loading (classic workflow)
+        # -------------------------------------------------------------
+        if comp is Component.WORKPIECE:
+            # Start timing _before_ calling voxeliser
+            self._start_voxelisation_timer()
+            self.service.voxelise(
+                Component.WORKPIECE,
+                pitch=self.pitch_spin.value()
             )
-        )
+        # Enable pitch input once any mesh exists
+        self.pitch_spin.setEnabled(True)
 
-    # -- Slots ----------------------------------------------------- #
+        # refresh button availability
+        self._update_voxel_button_state()
 
-    def _show_voxels(self, voxgrid) -> None:
-        """
-        Replace the central widget with a new :class:`VoxelWidget`
-        once voxelisation has finished.
+    def _on_voxel_ready(self, comp: Component):
+        vg = self.service.components[comp].voxgrid
 
-        Parameters
-        ----------
-        voxgrid : trimesh.voxel.VoxelGrid
-            The fully voxelised model emitted by :pydata:`voxelReady`.
-        """
-
-        # stop voxelisation timer & freeze duration
+        # stop voxelisation timer
         if self._vxl_timer.isActive():
             self._vxl_timer.stop()
         if self._vxl_start is not None:
@@ -108,25 +151,18 @@ class MainWindow(QMainWindow):
             self.voxelisation_label.setText(
                 f"Voxelisation finished: {vxl_elapsed:.1f} s"
             )
-        
+
         # start visualisation timer
         self._start_visualisation_timer()
 
-        viewer = VoxelWidget(voxgrid, surface_only=True)
-        viewer.voxelCountChanged.connect(
-            lambda n: self.voxel_label.setText(f"Voxel: {n:,}")
-        )
-        # show initial count right away
-        self.voxel_label.setText(f"Voxel: {viewer.voxel_count:,}")
-        self._viewer = viewer
+        # Ensure viewer exists
+        if self._viewer is None:
+            self._viewer = VoxelWidget(vg, surface_only=True)
+            self.setCentralWidget(self._viewer)
 
-        # GUI state updates
-        self.pitch_spin.setEnabled(True)
-        self.update_button.setEnabled(True)
+        self._viewer.update_component(comp, voxgrid=vg, surface_only=True)
 
-        self.setCentralWidget(viewer)
-
-        # stop visualisation timer & freeze duration
+        # stop visualisation timer
         if self._vis_timer.isActive():
             self._vis_timer.stop()
         if self._vis_start is not None:
@@ -136,13 +172,7 @@ class MainWindow(QMainWindow):
             )
 
     # timing helpers
-    def _on_update_clicked(self):
-        '''Triggered by the Update button.'''
-        self._start_voxelisation_timer()
-        self.service.voxelise(
-            self.service.mesh_model,
-            pitch=self.pitch_spin.value()
-        )
+    # (Removed _on_update_clicked as per instructions)
 
     # voxelisation timer
     def _start_voxelisation_timer(self):

@@ -2,7 +2,11 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtCore import pyqtSignal
 import numpy as np
 import pyqtgraph.opengl as gl
-from pyqtgraph.opengl import GLAxisItem, GLGridItem
+from pyqtgraph.opengl import GLAxisItem
+from pyqtgraph.Vector import Vector
+import trimesh
+
+from core.cadservice import Component
 
 class VoxelWidget(QWidget):
     
@@ -38,6 +42,13 @@ class VoxelWidget(QWidget):
         ``False`` → render every filled voxel as a cube.
     """
 
+    # Colour per component (R, G, B, A)
+    _COLOR = {
+        Component.WORKPIECE: (0.8, 0.1, 0.1, 1.0),  # red
+        Component.FIXTURE:   (0.2, 0.5, 0.8, 1.0),  # blue-ish
+        Component.TOOL:      (0.1, 0.8, 0.1, 1.0),  # green
+    }
+
     # Emits the filled-voxel count each time the mesh is (re)built
     voxelCountChanged = pyqtSignal(int)
 
@@ -51,12 +62,8 @@ class VoxelWidget(QWidget):
     ):
         
         """
-        Construct the widget, create an internal `GLViewWidget`, build a
-        cube mesh from the voxel grid and set the initial camera
-        position.
-
-        Heavy lifting is done in C via `pyqtgraph.opengl`, so the
-        constructor is still fast for moderately sized grids.
+        Construct an empty OpenGL viewer; items are added later via
+        update_component().
         """
 
         super().__init__(parent)
@@ -69,77 +76,143 @@ class VoxelWidget(QWidget):
         layout.addWidget(self.gl_view)
         self.gl_view.setBackgroundColor("w")
 
-        # Würfel-Mesh aus VoxelGrid
+        # Holds the GLMeshItem for each component slot
+        self._items: dict[Component, gl.GLMeshItem] = {}
+        self._axis: GLAxisItem | None = None
 
-        if surface_only:
-            #Render only the outer surface - far fewer triangles
-            surface_mesh = voxgrid.marching_cubes
-            vertices = surface_mesh.vertices.astype(float)
-            faces = surface_mesh.faces.astype(int)
-        else:
-            cube_mesh = voxgrid.as_boxes()
-            vertices  = np.asarray(cube_mesh.vertices, dtype=float)
-            faces     = np.asarray(cube_mesh.faces, dtype=int)
+        # Keep per‑component bounding boxes: {comp: (min_vec, max_vec)}
+        self._bounds_dict: dict[Component, tuple[np.ndarray, np.ndarray]] = {}
 
-        # choose the mesh whose bb we use for auto camera distance
-        mesh_for_extent = surface_mesh if surface_only else cube_mesh
+        # Remember the current global scene size to avoid unnecessary re‑scaling
+        self._global_ext: np.ndarray | None = None
 
-        # Emit voxel count
-        voxel_count = int(len(voxgrid.points))
-        self.voxel_count = voxel_count
-        self.voxelCountChanged.emit(voxel_count)
-
-        mesh_data  = gl.MeshData(vertexes=vertices, faces=faces)
-        mesh_item  = gl.GLMeshItem(meshdata=mesh_data, smooth=False,
-                                   shader="shaded", glOptions="opaque")
-        self.gl_view.addItem(mesh_item)
-
-        # -------------------------------------------------------------
-        # Coordinate system
-        # -------------------------------------------------------------
-        axis = GLAxisItem()
-        # Scale axis to match the bounding box of the voxel mesh
-        axis.setSize(
-            x=float(mesh_for_extent.extents[0]),
-            y=float(mesh_for_extent.extents[1]),
-            z=float(mesh_for_extent.extents[2]),
-        )
-        self.gl_view.addItem(axis)
-
-        # Optional: ground grid (XZ‑plane) for orientation
-        grid = GLGridItem()
-        grid.setSize(
-            mesh_for_extent.extents[0],
-            mesh_for_extent.extents[2],
-        )
-        grid.setSpacing(1, 1)  # visual spacing; adjust as needed
-        grid.translate(
-            -mesh_for_extent.extents[0] / 2,
-            -mesh_for_extent.extents[2] / 2,
-            -mesh_for_extent.extents[1] / 2,
-        )
-        self.gl_view.addItem(grid)
-
-        # Kameraposition
-
-        auto_distance      = np.linalg.norm(mesh_for_extent.extents) * 2
-        self.default_distance = camera_distance if camera_distance is not None else auto_distance
+        # Viewer starts empty; items are added via update_component(...)
+        self.default_distance = 150.0
         self.gl_view.setCameraPosition(distance=self.default_distance)
 
     # -------------------------------------------------------------
-    def zoom(self, factor: float = 0.9) -> None:
-       
+    def _build_item(
+        self,
+        component: Component,
+        *,
+        voxgrid=None,
+        mesh=None,
+        surface_only: bool = True,
+    ):
         """
-        Programmatically zoom the camera.
+        Add or replace a 3‑D item in the viewer.
 
         Parameters
         ----------
-        factor : float, default 0.9
-            Multiplicative scaling applied to the current camera
-            distance.  
-            * ``factor < 1``  → zoom in (closer)  
-            * ``factor > 1``  → zoom out (further)
+        component : Component
+            One of WORKPIECE, FIXTURE, TOOL.
+        voxgrid : trimesh.voxel.VoxelGrid, optional
+            Binary voxel model to visualise (workpiece / fixture).
+        mesh : trimesh.Trimesh, optional
+            Trimesh to display (tool or raw fixture).
+        surface_only : bool, default True
+            When viewing a VoxelGrid, choose Marching‑Cubes surface
+            instead of drawing thousands of cubes.
         """
+        # ---------------------------------------------------------
+        # 1) Remove previous item, if any
+        # ---------------------------------------------------------
+        if component in self._items:
+            self.gl_view.removeItem(self._items[component])
+            del self._items[component]
 
-        dist = self.gl_view.opts.get("distance", 10.0) * factor
-        self.gl_view.setCameraPosition(distance=dist)
+        # ---------------------------------------------------------
+        # 2) Build new vertices / faces
+        # ---------------------------------------------------------
+        if voxgrid is not None:
+            # Extract surface or cube-mesh and bring it into world space
+            if surface_only:
+                m = voxgrid.marching_cubes.copy()
+            else:
+                m = voxgrid.as_boxes().copy()
+
+            # Apply the scale/translation so physical size is independent of pitch
+            m.apply_transform(voxgrid.transform)
+
+            verts = m.vertices.astype(float)
+            faces = m.faces.astype(int)
+        elif mesh is not None:
+            verts = mesh.vertices.astype(float)
+            faces = mesh.faces.astype(int)
+        else:
+            return  # nothing to show
+
+        # ---------------------------------------------------------
+        # 3) Create or update the GLMeshItem for this component
+        # ---------------------------------------------------------
+        color = self._COLOR.get(component, (0.7, 0.7, 0.7, 1.0))
+        mesh_data = gl.MeshData(vertexes=verts, faces=faces)
+        item = gl.GLMeshItem(
+            meshdata=mesh_data,
+            smooth=False,
+            color=color,
+            shader="shaded",
+            glOptions="opaque",
+        )
+        self.gl_view.addItem(item)
+        self._items[component] = item
+
+        # ---------------------------------------------------------
+        # 4) Bounding boxes
+        #     • bei neuem Mesh  -> immer setzen
+        #     • bei Re‑Voxelisation -> nur ERWEITERN, nie schrumpfen
+        # ---------------------------------------------------------
+        vmin = verts.min(axis=0)
+        vmax = verts.max(axis=0)
+
+        if component not in self._bounds_dict or mesh is not None:
+            # Erstes Auftreten des Slots ODER neues Mesh ersetzt alte Box
+            self._bounds_dict[component] = (vmin, vmax)
+        else:
+            # Re‑Voxelisation (mesh==None): Box nur vergrößern
+            old_min, old_max = self._bounds_dict[component]
+            self._bounds_dict[component] = (
+                np.minimum(old_min, vmin),
+                np.maximum(old_max, vmax),
+            )
+
+        # Global bounds across all components
+        global_min = np.min(np.vstack([b[0] for b in self._bounds_dict.values()]), axis=0)
+        global_max = np.max(np.vstack([b[1] for b in self._bounds_dict.values()]), axis=0)
+        global_ext = global_max - global_min
+
+        # --- coordinate axis & camera – update only if scene grows -------
+        if self._global_ext is None:
+            # first time: take extents as-is
+            need_resize = True
+        else:
+            # Compare new global_ext with previous; allow small epsilon
+            need_resize = np.any(global_ext > self._global_ext + 1e-6)
+
+        if need_resize:
+            self._global_ext = global_ext.copy()
+
+            # Axis
+            if self._axis is None:
+                self._axis = GLAxisItem()
+                self.gl_view.addItem(self._axis)
+            self._axis.setSize(*map(float, global_ext))
+
+            # Camera only when scene expanded (avoid zooming out on re‑voxel)
+            global_center = (global_min + global_max) / 2.0
+            scene_dist = np.linalg.norm(global_ext) * 1.5
+            self.gl_view.setCameraPosition(distance=scene_dist)
+            self.gl_view.opts['center'] = Vector(*global_center)
+
+    def update_component(self, component: Component, *,
+                         voxgrid=None, mesh=None,
+                         surface_only: bool = True):
+        """
+        Public API: MainWindow calls this whenever one of the three
+        CAD components changes (new mesh loaded or workpiece voxel‑
+        grid updated).
+        """
+        self._build_item(component,
+                         voxgrid=voxgrid,
+                         mesh=mesh,
+                         surface_only=surface_only)
