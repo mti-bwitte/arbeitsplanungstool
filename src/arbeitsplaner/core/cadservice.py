@@ -56,6 +56,9 @@ class CADService(QObject):
     meshReady  = pyqtSignal(Component)  # component ready (mesh loaded)
     voxelReady = pyqtSignal(Component)  # component ready (voxgrid finished)
     voxeliserUsed = pyqtSignal(str)
+    editorReady = pyqtSignal(trimesh.voxel.VoxelGrid)
+    voxelsRemoved = pyqtSignal(np.ndarray, np.ndarray, np.ndarray)
+    # Emits three integer arrays (ix, iy, iz) of the voxels just removed
 
     def __init__(self, parent: QObject | None = None):
         """
@@ -166,6 +169,24 @@ class CADService(QObject):
                     self.fn(self.mesh, self.pitch)
 
             _POOL.start(_VoxelJob(self._voxelise_sync, mesh, pitch))
+
+    # ------------------------------------------------------------------
+    # Utility: convert a world‑space coordinate (mm) to voxel index
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _world_to_index(world_xyz: np.ndarray, origin: np.ndarray, pitch: float) -> np.ndarray:
+        """
+        Parameters
+        ----------
+        world_xyz : np.ndarray(3,)  – point in millimetres
+        origin    : np.ndarray(3,)  – world position of voxel (0,0,0)
+        pitch     : float           – mm per voxel
+
+        Returns
+        -------
+        np.ndarray(3,) integer – voxel indices (ix, iy, iz)
+        """
+        return np.floor((world_xyz - origin) / pitch).astype(int)
 
     def _voxelise_sync(self, mesh: trimesh.Trimesh, pitch: float) -> None:
         """
@@ -278,3 +299,154 @@ class CADService(QObject):
         self.components[target].voxgrid = voxgrid
 
         self.voxelReady.emit(target)
+
+    # ------------------------------------------------------------------
+    def turn_to_editorview(self, pitch: float) -> None:
+        """
+        Build a 'material-to-be-removed' voxel field.
+
+        • Takes the WORKPIECE voxel grid (must already exist).
+        • Computes its local bounding box (same shape as occ array).
+        • Creates a boolean array `to_mill` that is ``True`` everywhere
+          inside the box *except* where the actual workpiece occupies
+          material.
+        • Stores the new array in ``voxgrid.metadata['to_mill']`` and
+          emits it via `editorReady`, so any UI can visualise green
+          transparent voxels to mill away.
+
+        Parameters
+        ----------
+        pitch : float
+            Only required if no voxel grid exists yet and we need to
+            rasterise.  In the normal workflow the voxel grid is
+            already present; pitch is ignored then.
+
+        Notes
+        -----
+        `removed` voxels will be toggled by `mill_tool` during simulation.
+        """
+        wp = Component.WORKPIECE
+        voxgrid = self.components[wp].voxgrid
+
+        if voxgrid is None:
+            # workpiece not yet voxelised – fallback to voxelise now
+            self.voxelise(wp, pitch=pitch)
+            voxgrid = self.components[wp].voxgrid
+            if voxgrid is None:
+                return  # still nothing – abort
+
+        # occupancy array (bool) : True = material present
+        occ = voxgrid.metadata.get("occ", None)
+        if occ is None:
+            # fallback: derive from matrix property
+            occ = voxgrid.matrix.astype(bool)
+
+        # to_mill True where NO workpiece material
+        to_mill = ~occ
+
+        # attach to metadata for downstream visualisation
+        voxgrid.metadata["to_mill"] = to_mill
+
+        # emit signal so MainWindow can update the viewer
+        self.editorReady.emit(voxgrid)
+
+    # ------------------------------------------------------------------
+    def mill_tool(
+        self,
+        centre_mm: np.ndarray,
+        *,
+        radius_mm: float,
+        length_mm: float,
+        axis: str = "y",
+    ) -> None:
+        """
+        Remove (mill) all voxels whose centres lie inside a cylindrical
+        tool footprint along the specified axis.
+
+        Parameters
+        ----------
+            centre_mm : np.ndarray(3,)   – world‑space coord of cutter *centre*
+            radius_mm : float            – cutter radius in mm
+            length_mm : float            – cutter flute length in mm (along axis)
+            axis      : str              – 'x', 'y', or 'z' (tool axis direction)
+        """
+        wp = Component.WORKPIECE
+        vg = self.components[wp].voxgrid
+        if vg is None or "occ" not in vg.metadata:
+            return  # nothing to mill
+
+        occ = vg.metadata["occ"]
+        to_mill = vg.metadata.get("to_mill", None)
+        if to_mill is None:
+            to_mill = ~occ
+            vg.metadata["to_mill"] = to_mill
+
+        pitch = vg.transform[0, 0]
+        origin = vg.transform[:3, 3]
+
+        # Normalize axis and get index
+        axis = axis.lower()
+        axis_idx = {"x": 0, "y": 1, "z": 2}.get(axis, 1)  # default y
+
+        # Compute tip and top in world coordinates
+        half_len = length_mm * 0.5
+        axis_vec = np.zeros(3)
+        axis_vec[axis_idx] = 1.0
+        tip_mm = centre_mm - axis_vec * half_len
+        top_mm = centre_mm + axis_vec * half_len
+
+        tip_idx = self._world_to_index(tip_mm, origin, pitch)
+        top_idx = self._world_to_index(top_mm, origin, pitch)
+
+        # Compute bounding ranges for all axes
+        r_cells = int(np.ceil(radius_mm / pitch))
+        ranges = [None, None, None]
+        centre_idx = self._world_to_index(centre_mm, origin, pitch)
+        for ax in range(3):
+            if ax == axis_idx:
+                start = min(tip_idx[ax], top_idx[ax])
+                end   = max(tip_idx[ax], top_idx[ax])
+                ranges[ax] = np.arange(start, end + 1)
+            else:
+                centre = centre_idx[ax]
+                ranges[ax] = np.arange(centre - r_cells, centre + r_cells + 1)
+
+        xs, ys, zs = ranges
+
+        # Clamp to grid bounds
+        xs = xs[(xs >= 0) & (xs < occ.shape[0])]
+        ys = ys[(ys >= 0) & (ys < occ.shape[1])]
+        zs = zs[(zs >= 0) & (zs < occ.shape[2])]
+
+        if xs.size == 0 or ys.size == 0 or zs.size == 0:
+            return
+
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+
+        # Compute radial distance perpendicular to axis, relative to centre_mm
+        if axis_idx == 0:  # X axis tool
+            dy = (Y + 0.5) * pitch + origin[1] - centre_mm[1]
+            dz = (Z + 0.5) * pitch + origin[2] - centre_mm[2]
+            radial = np.sqrt(dy**2 + dz**2)
+        elif axis_idx == 1:  # Y axis
+            dx = (X + 0.5) * pitch + origin[0] - centre_mm[0]
+            dz = (Z + 0.5) * pitch + origin[2] - centre_mm[2]
+            radial = np.sqrt(dx**2 + dz**2)
+        else:  # Z axis
+            dx = (X + 0.5) * pitch + origin[0] - centre_mm[0]
+            dy = (Y + 0.5) * pitch + origin[1] - centre_mm[1]
+            radial = np.sqrt(dx**2 + dy**2)
+
+        # Add half‑voxel margin so edge‑touching voxels are removed too
+        safe_radius = radius_mm + (pitch * 0.5)
+        mask = radial <= safe_radius
+
+        # Apply removal
+        occ[X[mask], Y[mask], Z[mask]] = False
+        to_mill[X[mask], Y[mask], Z[mask]] = False
+
+        # Emit indices of removed voxels
+        self.voxelsRemoved.emit(X[mask], Y[mask], Z[mask])
+
+        # Notify viewer to refresh WORKPIECE rendering
+        self.editorReady.emit(vg)

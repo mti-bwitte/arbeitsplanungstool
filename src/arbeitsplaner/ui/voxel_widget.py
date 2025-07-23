@@ -1,5 +1,7 @@
+from typing import Tuple
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt
 import numpy as np
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import GLAxisItem
@@ -51,6 +53,8 @@ class VoxelWidget(QWidget):
 
     # Emits the filled-voxel count each time the mesh is (re)built
     voxelCountChanged = pyqtSignal(int)
+    # Emits new world position of the tool centre after every move
+    toolMoved = pyqtSignal(np.ndarray)
 
     def __init__(
         self,
@@ -75,9 +79,14 @@ class VoxelWidget(QWidget):
         self.gl_view = gl.GLViewWidget()
         layout.addWidget(self.gl_view)
         self.gl_view.setBackgroundColor("w")
+        # Forward key events from GLViewWidget to this widget
+        self.gl_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.gl_view.installEventFilter(self)
 
-        # Holds the GLMeshItem for each component slot
-        self._items: dict[Component, gl.GLMeshItem] = {}
+        # Holds the GLMeshItem(s) for every component.
+        # WORKPIECE → tuple(red_mesh, green_mesh)
+        # others    → single GLMeshItem
+        self._items: dict[Component, object] = {}
         self._axis: GLAxisItem | None = None
 
         # Keep per‑component bounding boxes: {comp: (min_vec, max_vec)}
@@ -89,6 +98,14 @@ class VoxelWidget(QWidget):
         # Viewer starts empty; items are added via update_component(...)
         self.default_distance = 150.0
         self.gl_view.setCameraPosition(distance=self.default_distance)
+
+        # Allow the widget to receive key events
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # Track current tool position in world space
+        self.tool_pos = np.zeros(3)
+        # Absolute centre of the TOOL mesh in world coordinates (mm)
+        self._tool_origin: np.ndarray | None = None
 
     # -------------------------------------------------------------
     def _build_item(
@@ -118,7 +135,11 @@ class VoxelWidget(QWidget):
         # 1) Remove previous item, if any
         # ---------------------------------------------------------
         if component in self._items:
-            self.gl_view.removeItem(self._items[component])
+            if isinstance(self._items[component], tuple):
+                for it in self._items[component]:
+                    self.gl_view.removeItem(it)
+            else:
+                self.gl_view.removeItem(self._items[component])
             del self._items[component]
 
         # ---------------------------------------------------------
@@ -139,6 +160,9 @@ class VoxelWidget(QWidget):
         elif mesh is not None:
             verts = mesh.vertices.astype(float)
             faces = mesh.faces.astype(int)
+            # Remember the TOOL mesh world‑space centre once
+            if component is Component.TOOL and self._tool_origin is None:
+                self._tool_origin = verts.mean(axis=0)
         else:
             return  # nothing to show
 
@@ -155,7 +179,41 @@ class VoxelWidget(QWidget):
             glOptions="opaque",
         )
         self.gl_view.addItem(item)
-        self._items[component] = item
+
+        # ---------------------------------------------------------
+        # 3b) Optional green layer for WORKPIECE ('to_mill')
+        # ---------------------------------------------------------
+        extra_items: Tuple[gl.GLMeshItem, ...] = ()
+        if (
+            component is Component.WORKPIECE
+            and voxgrid is not None
+            and "to_mill" in voxgrid.metadata
+        ):
+            # Visualise the "to_mill" voxels as a green surface mesh for better visibility
+            to_mill = voxgrid.metadata["to_mill"]
+            if to_mill.any():
+                vg_mill = trimesh.voxel.VoxelGrid(
+                    to_mill, transform=voxgrid.transform
+                )
+                # Render every voxel as a cube so the entire bounding box
+                # becomes visible, not just the outer surface.
+                green_boxes = vg_mill.as_boxes().copy()
+                #green_boxes.apply_transform(vg_mill.transform)
+
+                g_verts = green_boxes.vertices.astype(float)
+                g_faces = green_boxes.faces.astype(int)
+                g_data = gl.MeshData(vertexes=g_verts, faces=g_faces)
+                green_item = gl.GLMeshItem(
+                    meshdata=g_data,
+                    smooth=False,
+                    color=(0.0, 1.0, 0.0, 0.25),   # light transparency
+                    shader="shaded",
+                    glOptions="translucent",
+                )
+                self.gl_view.addItem(green_item)
+                extra_items = (green_item,)
+
+        self._items[component] = (item, *extra_items) if extra_items else item
 
         # ---------------------------------------------------------
         # 4) Bounding boxes
@@ -216,3 +274,49 @@ class VoxelWidget(QWidget):
                          voxgrid=voxgrid,
                          mesh=mesh,
                          surface_only=surface_only)
+
+    # -------------------------------------------------------------
+    # Simple keyboard control for the TOOL component
+    # WASD keys   → X/Z plane movement
+    # Q / E       → vertical movement (Y)
+    # -------------------------------------------------------------
+    def keyPressEvent(self, event):
+        step = 1.0  # mm per key press; adjust as needed
+
+        key_map = {
+            Qt.Key.Key_A: (-step, 0.0, 0.0),   # left  (X-)
+            Qt.Key.Key_D: ( step, 0.0, 0.0),   # right (X+)
+            Qt.Key.Key_W: ( 0.0, 0.0,  step),  # forward (Z+)
+            Qt.Key.Key_S: ( 0.0, 0.0, -step),  # back    (Z-)
+            Qt.Key.Key_E: ( 0.0,  step, 0.0),  # up      (Y+)
+            Qt.Key.Key_Q: ( 0.0, -step, 0.0),  # down    (Y-)
+        }
+
+        move = key_map.get(event.key())
+        if move and Component.TOOL in self._items:
+            dx, dy, dz = move
+            gl_item = self._items[Component.TOOL]
+            if isinstance(gl_item, tuple):  # should not happen, but guard
+                gl_item = gl_item[0]
+            gl_item.translate(dx, dy, dz)
+            self.tool_pos += np.array([dx, dy, dz])
+            # Notify listeners (e.g., CADService) about new tool position
+            if self._tool_origin is not None:
+                abs_pos = self._tool_origin + self.tool_pos
+                self.toolMoved.emit(abs_pos)
+            else:
+                self.toolMoved.emit(self.tool_pos.copy())
+            self.gl_view.update()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    # -------------------------------------------------------------
+    # Forward key events from the inner GLViewWidget to keyPressEvent
+    # -------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self.gl_view and event.type() == QEvent.Type.KeyPress:
+            self.keyPressEvent(event)
+            return True  # event handled
+        return super().eventFilter(obj, event)
