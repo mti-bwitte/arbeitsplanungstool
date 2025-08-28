@@ -68,9 +68,11 @@ class MainWindow(QMainWindow):
         self.voxel_button.clicked.connect(self._on_voxel_clicked)
         self.voxel_button.setEnabled(False)  # enabled after first mesh
 
-        # Voxel counter in the status bar
-        self.voxel_label = QLabel("Voxel: 0")
-        self.statusBar().addPermanentWidget(self.voxel_label)
+        # Two voxel counters in the status bar
+        self.voxel_shown_label = QLabel("Voxels shown: 0")
+        self.voxel_mill_label = QLabel("Voxels to mill: 0")
+        self.statusBar().addPermanentWidget(self.voxel_shown_label)
+        self.statusBar().addPermanentWidget(self.voxel_mill_label)
 
         # Editor‑view toggle (acts like a switch)
         self.editor_toggle = QToolButton()
@@ -213,6 +215,8 @@ class MainWindow(QMainWindow):
 
         # Enable editor view once the workpiece voxels are ready
         if comp is Component.WORKPIECE:
+            # --- Update voxel count labels with helper -------------------
+            self._update_voxel_counters(vg)
             self.editor_toggle.setEnabled(True)
 
     # -- Editor view signal handler ---------------------------------- #
@@ -230,6 +234,9 @@ class MainWindow(QMainWindow):
             voxgrid=voxgrid,
             surface_only=True,
         )
+
+        # --- Refresh voxel count for editor‑view ------------------------
+        self._update_voxel_counters(voxgrid)
 
     # timing helpers
     # (Removed _on_update_clicked as per instructions)
@@ -289,7 +296,7 @@ class MainWindow(QMainWindow):
 
         # --- Derive cutter geometry from bounding box -----------------
         ext = tool_mesh.extents.astype(float)       # (x_len, y_len, z_len)
-        axis_idx = int(np.argmax(ext))              # flute axis
+        axis_idx = int(np.argmax(ext))              # which ’ext’ is the longest?
         length_mm = float(ext[axis_idx])
         radius_mm = float(max(np.delete(ext, axis_idx)) / 2.0)
         axis_char = ("x", "y", "z")[axis_idx]
@@ -300,3 +307,21 @@ class MainWindow(QMainWindow):
             length_mm=length_mm,
             axis=axis_char,
         )
+    # ------------------------------------------------------------------
+    def _update_voxel_counters(self, vg):
+        """
+        Update status‑bar counters:
+        • Voxels shown   – every voxel currently visualised
+        • Voxels to mill – remaining green voxels (to_mill True)
+        """
+        if vg is None:
+            return
+
+        occ_arr = vg.metadata.get("occ", vg.matrix.astype(bool))
+        to_mill_arr = vg.metadata.get("to_mill", np.zeros_like(occ_arr))
+
+        shown = int(np.count_nonzero(np.logical_or(occ_arr, to_mill_arr)))
+        to_mill_remaining = int(np.count_nonzero(to_mill_arr))
+
+        self.voxel_shown_label.setText(f"Voxels shown: {shown:,}")
+        self.voxel_mill_label.setText(f"Voxels to mill: {to_mill_remaining:,}")
