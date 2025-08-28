@@ -1,3 +1,16 @@
+# ---------------------------------------------------------------------------
+# [bryan-mti annotations]
+# This module loads CAD data, voxelises it, and provides utilities
+# for the editor / milling simulation. Quick glossary:
+#  - pitch: voxel edge length in millimetres (mm per cell)
+#  - origin: world coordinate of the voxel corner at index (0,0,0)
+#  - occ: boolean 3D array (True = material present)
+#  - removed: boolean 3D array (True = already milled away)
+#  - to_mill: boolean 3D array (True = still to be milled; UI logic)
+#  - transform: 4x4 matrix containing scale (=pitch) and translation (=origin)
+# Notes: np.arange(a, b) is half-open (b is exclusive) → use b+1 for inclusive ranges.
+# np.meshgrid(..., indexing="ij") builds i,j,k grids matching (x,y,z).
+# ---------------------------------------------------------------------------
 from pathlib import Path
 import trimesh
 import os
@@ -8,7 +21,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
     QThreadPool,
     QRunnable,
-)
+)  # Qt core classes, signals, thread pool, runnable
 
 # Try to import QtConcurrent; fall back to a thread‑pool runnable
 try:
@@ -21,11 +34,14 @@ except ImportError:  # QtConcurrent not shipped in some distro builds
 from enum import Enum, auto
 from dataclasses import dataclass
 
+# Path objects for convenient file handling
+
 class Component(Enum):
     WORKPIECE = auto()
     FIXTURE   = auto()
     TOOL      = auto()
 
+# Per-slot container: mesh, voxel grid, display name
 @dataclass
 class CadComponent:
     mesh: trimesh.Trimesh | None = None
@@ -51,14 +67,16 @@ class CADService(QObject):
     The public API remains synchronous from the caller's perspective.
     Internally, :pymeth:`voxelise` hands the blocking work to a
     Qt thread‑pool via *QtConcurrent.run* and returns immediately.
+    [bryan-mti] Quick overview: the GUI stays responsive; heavy work runs in a worker thread.
     """
 
+    # --- Qt signals ------------------------------------------------------------
     meshReady  = pyqtSignal(Component)  # component ready (mesh loaded)
     voxelReady = pyqtSignal(Component)  # component ready (voxgrid finished)
-    voxeliserUsed = pyqtSignal(str)
-    editorReady = pyqtSignal(trimesh.voxel.VoxelGrid)
+    voxeliserUsed = pyqtSignal(str)  # e.g. "Open3D CPU" or later "GPU"
+    editorReady = pyqtSignal(trimesh.voxel.VoxelGrid)  # Editor should re-render the voxel grid
     voxelsRemoved = pyqtSignal(np.ndarray, np.ndarray, np.ndarray)
-    # Emits three integer arrays (ix, iy, iz) of the voxels just removed
+    # Indices of removed voxels → for UI updates / counters / undo
 
     def __init__(self, parent: QObject | None = None):
         """
@@ -72,7 +90,7 @@ class CADService(QObject):
         """
         super().__init__(parent)
     
-        # predefined slots for the three CAD elements
+        # Typed slots for clean signals / API
         self.components: dict[Component, CadComponent] = {
             c: CadComponent(display=c.name.capitalize()) for c in Component
         }
@@ -91,15 +109,17 @@ class CADService(QObject):
         """
         from PyQt6.QtWidgets import QFileDialog
 
+        # Simple file picker; returns a path string or '' on cancel
         path, _ = QFileDialog.getOpenFileName(
             None,
             f"Select {target.name.capitalize()} file",
             "",
-            "CAD files (*.stl *.step *.stp)",
+            "CAD files (*.stl *.step *.stp)",  # Note: filter allows *.stl, *.step, *.stp
         )
-        if not path:
+        if not path:  # user cancelled
             return
 
+        # Load mesh; for STEP, trimesh may triangulate depending on backend
         mesh = trimesh.load(Path(path))
         self.components[target].mesh = mesh
         self.meshReady.emit(target)
@@ -133,13 +153,14 @@ class CADService(QObject):
         not block.
         """
 
-        if target is not Component.WORKPIECE:
+        if target is not Component.WORKPIECE:  # currently only voxelising the workpiece
             return
 
         mesh = self.components[target].mesh
-        if mesh is None:
+        if mesh is None:  # no mesh loaded yet
             return
         
+        # Remember which slot to report in signals
         self._current_target = target
 
         if _HAVE_CONCURRENT:
@@ -147,7 +168,7 @@ class CADService(QObject):
             qrun(self._voxelise_sync, mesh, pitch)
         else:
             # ----------------------------------------------------------------
-            # Fallback: run in the global QThreadPool via a small QRunnable
+            # Fallback: use global QThreadPool if QtConcurrent is unavailable
             # that simply delegates to the existing _voxelise_sync function.
             # ----------------------------------------------------------------
             class _VoxelJob(QRunnable):
@@ -171,7 +192,7 @@ class CADService(QObject):
             _POOL.start(_VoxelJob(self._voxelise_sync, mesh, pitch))
 
     # ------------------------------------------------------------------
-    # Utility: convert a world‑space coordinate (mm) to voxel index
+    # Utilities
     # ------------------------------------------------------------------
     @staticmethod
     def _world_to_index(world_xyz: np.ndarray, origin: np.ndarray, pitch: float) -> np.ndarray:
@@ -186,7 +207,7 @@ class CADService(QObject):
         -------
         np.ndarray(3,) integer – voxel indices (ix, iy, iz)
         """
-        return np.floor((world_xyz - origin) / pitch).astype(int)
+        return np.floor((world_xyz - origin) / pitch).astype(int)  # Example: world=[7,4,2], origin=[0,0,0], pitch=2 → idx=[3,2,1]
 
     def _voxelise_sync(self, mesh: trimesh.Trimesh, pitch: float) -> None:
         """
@@ -220,12 +241,13 @@ class CADService(QObject):
         import open3d as o3d
         import numpy as np
 
+        # Local imports so top-level import stays fast and tests can run without O3D
+
         # --- Step 1 : Trimesh → Open3D TriangleMesh ---------------------------
         # o3d_mesh : open3d.geometry.TriangleMesh
         #   Dense triangle surface in Open3D format.
         #   Example → vertices[0] == [12.3,  7.8, -4.1]
-        # Create an Open3D mesh from the raw vertex / face arrays.
-        # (No voxelisation yet – just preparing the data container.)
+        # Example: mesh.vertices.shape == (V,3), mesh.faces.shape == (F,3)
         o3d_mesh = o3d.geometry.TriangleMesh(
             o3d.utility.Vector3dVector(mesh.vertices),
             o3d.utility.Vector3iVector(mesh.faces.astype(np.int32)),
@@ -235,9 +257,7 @@ class CADService(QObject):
         # o3d_voxgrid : open3d.geometry.VoxelGrid  (sparse)
         #   Holds only the filled voxels as a hash‑set of 3‑D indices.
         #   Example list → [(12, 7, 3), (12, 7, 4), (13, 7, 3), …]
-        # `VoxelGrid.create_from_triangle_mesh()` rasterises the surface into a
-        # sparse voxel set on the CPU. A subsequent binary_fill_holes() 
-        # will ensure a solid interior.
+        # VoxelGrid.create_from_triangle_mesh rasterises the surface; interior still 'hollow' at this point
         o3d_voxgrid = o3d.geometry.VoxelGrid.create_from_triangle_mesh(
             o3d_mesh, voxel_size=float(pitch)   
         )
@@ -246,28 +266,30 @@ class CADService(QObject):
         # --- Step 3 : Sparse → dense boolean volume --------------------------
         # indices : np.ndarray[int32]  shape=(n,3)
         #   Each row is (ix, iy, iz) of a filled voxel, i.e. sparse list.
+        # indices.shape = (n,3), n = number of filled voxels (sparse set)
         indices = np.asarray([v.grid_index for v in o3d_voxgrid.get_voxels()])
         if indices.size == 0:
+            # Minimal empty grid to avoid edge cases
             dense = np.zeros((1, 1, 1), dtype=bool)
         else:
-            # dims : np.ndarray[int32]   e.g. [64, 80, 40]  => grid size
+            # dims = max indices + 1  (array size in x,y,z)
             dims = indices.max(axis=0) + 1          # (nx, ny, nz)
-            # dense : np.ndarray[bool]  shape=dims
-            #   Dense 3‑D occupancy grid, True = voxel solid.
+            # Sparse → dense occupancy (surface only)
             dense = np.zeros(dims, dtype=bool)
             dense[indices[:, 0], indices[:, 1], indices[:, 2]] = True
 
-        # optional: close internal cavities
+        # optional: close internal cavities (surface → solid volume)
         from scipy.ndimage import binary_fill_holes
 
-        dense = binary_fill_holes(dense)            # 3D-NumPy-Array with boolean values
+        dense = binary_fill_holes(dense)            # Result: 3D bool array, True = material (interior and surface)
 
         # -----------------------------------------------------------------
         # Build attribute arrays
         # -----------------------------------------------------------------
+        # Attribute bundle for future fields (e.g., temperature, stress, labels)
         # 1) occ  – occupancy: True  → material present
         #                     False → already empty (either never there or milled away)
-        occ = dense.astype(bool)
+        occ = dense.astype(bool) 
 
         # 2) removed – initially everything is NOT removed
         #    During the milling simulation you flip voxels to True.
@@ -282,19 +304,19 @@ class CADService(QObject):
         }
 
         # ------- 4. wrap everything in a Trimesh VoxelGrid --------------
-        # Transform encodes BOTH voxel size (scale) and origin (translation)
-        # so that physical dimensions remain invariant when pitch changes.
+        # pitch is mm per cell → preserves physical dimensions across resolutions
+        # origin from O3D grid: world position of voxel corner (0,0,0)
         transform = np.eye(4, dtype=float)
         transform[:3, :3] *= float(pitch)           # uniform scale
         transform[:3, 3] = np.asarray(o3d_voxgrid.origin, dtype=float)  # translation
 
+        # Trimesh VoxelGrid wraps dense bool array + transform
         voxgrid = trimesh.voxel.VoxelGrid(occ, transform=transform)
 
-        # Attach the attribute dictionary so downstream code can access
-        # or modify 'occ', 'removed', and future fields.
+        # Extra data accessible via vg.metadata['occ'], ['removed'], ['to_mill'], ...
         voxgrid.metadata = attr
 
-        # store into the correct slot
+        # Put into the correct slot and emit signal
         target = self._current_target or Component.WORKPIECE
         self.components[target].voxgrid = voxgrid
 
@@ -338,10 +360,10 @@ class CADService(QObject):
         # occupancy array (bool) : True = material present
         occ = voxgrid.metadata.get("occ", None)
         if occ is None:
-            # fallback: derive from matrix property
+            # Fallback: matrix stores occupancy
             occ = voxgrid.matrix.astype(bool)
 
-        # to_mill True where NO workpiece material
+        # 'still to mill' = everywhere there is currently no workpiece material
         to_mill = ~occ
 
         # attach to metadata for downstream visualisation
@@ -369,36 +391,45 @@ class CADService(QObject):
             radius_mm : float            – cutter radius in mm
             length_mm : float            – cutter flute length in mm (along axis)
             axis      : str              – 'x', 'y', or 'z' (tool axis direction)
+
+        Example values:
+          centre_mm = np.array([100.0, 50.0, 20.0])
+          radius_mm = 5.0
+          length_mm = 30.0
+          axis      = "y"
         """
         wp = Component.WORKPIECE
         vg = self.components[wp].voxgrid
         if vg is None or "occ" not in vg.metadata:
             return  # nothing to mill
 
+        # occ = occupancy; to_mill = editor logic layer (True = still to be removed)
         occ = vg.metadata["occ"]
         to_mill = vg.metadata.get("to_mill", None)
         if to_mill is None:
             to_mill = ~occ
             vg.metadata["to_mill"] = to_mill
 
+        # pitch: mm per voxel, origin: world position of voxel corner (0,0,0)
         pitch = vg.transform[0, 0]
         origin = vg.transform[:3, 3]
 
         # Normalize axis and get index
         axis = axis.lower()
-        axis_idx = {"x": 0, "y": 1, "z": 2}.get(axis, 1)  # default y
+        axis_idx = {"x": 0, "y": 1, "z": 2}.get(axis, 1)  # axis_idx 0/1/2 → X/Y/Z; default Y for robustness
 
-        # Compute tip and top in world coordinates
+        # Cylinder endpoints in world coordinates (centre ± half length)
         half_len = length_mm * 0.5
         axis_vec = np.zeros(3)
         axis_vec[axis_idx] = 1.0
         tip_mm = centre_mm - axis_vec * half_len
         top_mm = centre_mm + axis_vec * half_len
 
+        # world → voxel index: floor((p - origin)/pitch)
         tip_idx = self._world_to_index(tip_mm, origin, pitch)
         top_idx = self._world_to_index(top_mm, origin, pitch)
 
-        # Compute bounding ranges for all axes
+        # r_cells: radius in cells (ceil); centre_idx: voxel index of the centre
         r_cells = int(np.ceil(radius_mm / pitch))
         ranges = [None, None, None]
         centre_idx = self._world_to_index(centre_mm, origin, pitch)
@@ -413,15 +444,17 @@ class CADService(QObject):
 
         xs, ys, zs = ranges
 
-        # Clamp to grid bounds
+        # Clamping prevents out-of-bounds indexing
         xs = xs[(xs >= 0) & (xs < occ.shape[0])]
         ys = ys[(ys >= 0) & (ys < occ.shape[1])]
         zs = zs[(zs >= 0) & (zs < occ.shape[2])]
 
         if xs.size == 0 or ys.size == 0 or zs.size == 0:
-            return
+            return  # No overlap with grid → nothing to do
 
+        # X,Y,Z are 3D arrays of equal shape; they contain index coordinates of all candidates
         X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+        # Example: X[i,j,k] == xs[i], Y[i,j,k] == ys[j], Z[i,j,k] == zs[k]
 
         # Compute radial distance perpendicular to axis, relative to centre_mm
         if axis_idx == 0:  # X axis tool
@@ -437,16 +470,17 @@ class CADService(QObject):
             dy = (Y + 0.5) * pitch + origin[1] - centre_mm[1]
             radial = np.sqrt(dx**2 + dy**2)
 
-        # Add half‑voxel margin so edge‑touching voxels are removed too
+        # +0.5*pitch: safety margin so edge-touching cells are captured
         safe_radius = radius_mm + (pitch * 0.5)
         mask = radial <= safe_radius
 
-        # Apply removal
+        # mask is a 3D boolean array; True = cell centre lies within/on radius
+        # Advanced indexing: X[mask], Y[mask], Z[mask] yield 1D lists of hit coordinates
         occ[X[mask], Y[mask], Z[mask]] = False
         to_mill[X[mask], Y[mask], Z[mask]] = False
 
-        # Emit indices of removed voxels
+        # Enables e.g., counters / animated effects / logging
         self.voxelsRemoved.emit(X[mask], Y[mask], Z[mask])
 
-        # Notify viewer to refresh WORKPIECE rendering
+        # Viewer should re-render (material removal visible)
         self.editorReady.emit(vg)
