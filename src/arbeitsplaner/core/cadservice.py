@@ -484,3 +484,6 @@ class CADService(QObject):
 
         # Viewer should re-render (material removal visible)
         self.editorReady.emit(vg)
+
+def testfunc():
+    return

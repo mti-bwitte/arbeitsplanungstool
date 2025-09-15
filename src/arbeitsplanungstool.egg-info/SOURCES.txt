@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/arbeitsplaner/__init__.py
+src/arbeitsplaner/app.py
+src/arbeitsplaner/core/__init__.py
+src/arbeitsplaner/core/cadservice.py
+src/arbeitsplaner/ui/__init__.py
+src/arbeitsplaner/ui/main_window.py
+src/arbeitsplaner/ui/voxel_widget.py
+src/arbeitsplanungstool.egg-info/PKG-INFO
+src/arbeitsplanungstool.egg-info/SOURCES.txt
+src/arbeitsplanungstool.egg-info/dependency_links.txt
+src/arbeitsplanungstool.egg-info/top_level.txt

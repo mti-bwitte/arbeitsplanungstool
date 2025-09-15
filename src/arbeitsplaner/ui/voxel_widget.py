@@ -42,6 +42,13 @@ class VoxelWidget(QWidget):
     surface_only : bool, default False
         ``True`` → render only the outer surface (Marching‑Cubes),
         ``False`` → render every filled voxel as a cube.
+
+    Viewer hotkeys
+    --------------
+    L       : cycle mesh shader (shaded / balloon / viewNormalColor / normalColor)
+    B       : cycle background color (light grey / dark / white)
+    Ctrl+P  : save current camera (distance/azimuth/elevation/center/fov)
+    Ctrl+O  : restore saved camera exactly
     """
 
     # Colour per component (R, G, B, A)
@@ -72,16 +79,51 @@ class VoxelWidget(QWidget):
 
         super().__init__(parent)
 
+        # --- Viewer appearance controls (lighting/shader & background) ---
+        # Available mesh shaders provided by pyqtgraph.opengl
+        self._shader_names = [
+            "shaded",
+            "balloon",
+            "viewNormalColor",
+            "normalColor",
+            "viewRed",
+            "normalRed",
+            "allRed",   # NEU
+        ]
+        self._shader_idx: int = 0
+
+        # Background presets to improve contrast in screenshots
+        self._bg_colors: list[str] = ["#f0f0f0", "#202020", "w"]
+        self._bg_idx: int = 0
+
         # Layout & OpenGL-View
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.gl_view = gl.GLViewWidget()
         layout.addWidget(self.gl_view)
-        self.gl_view.setBackgroundColor("w")
+        # start with a light grey background for better contrast
+        self.gl_view.setBackgroundColor(self._bg_colors[self._bg_idx])
         # Forward key events from GLViewWidget to this widget
         self.gl_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.gl_view.installEventFilter(self)
+        # Also watch key events on ourselves to be extra safe
+        self.installEventFilter(self)
+
+        # Make sure our GL view gets keyboard focus for hotkeys
+        self.gl_view.setFocus()
+
+        # Debug toggle for key actions
+        self._debug_keys = True
+
+        # Tunables for the "normalRed" mixed mode
+        self._mix_normal_red_alpha = 0.75  # more towards red (brighter, less bunt)
+        self._mix_normal_red_gamma = 0.85  # brighter midtones
+        self._mix_normal_red_ambient = 0.28  # overall brighter base
+
+        # Saturation/strength for viewRed (1.0 = original strong red, lower = less intense/brighter)
+        self._viewred_saturation = 0.85
+
 
         # Holds the GLMeshItem(s) for every component.
         # WORKPIECE → tuple(red_mesh, green_mesh)
@@ -102,10 +144,35 @@ class VoxelWidget(QWidget):
         # Allow the widget to receive key events
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
+        # Route focus from the container to the GL view so key events land there
+        self.setFocusProxy(self.gl_view)
+
         # Track current tool position in world space
         self.tool_pos = np.zeros(3)
         # Absolute centre of the TOOL mesh in world coordinates (mm)
         self._tool_origin: np.ndarray | None = None
+
+        # Saved camera state (set via Ctrl+P)
+        self._saved_cam: dict | None = None
+
+        # Parameters for brightness overlay applied to all modes
+        self._cm_gamma: float = 0.75   # <1.0 lifts midtones (brighter)
+        self._cm_ambient: float = 0.30 # base fill light
+
+        # Simple multi-light model for brightness overlay
+        self._light_dirs = {
+            'right': np.array([1.0, 0.0, 0.0]),  # from +X
+            'top':   np.array([0.0, 1.0, 0.0]),  # from +Y
+            'front': np.array([0.0, 0.0, 1.0]),  # from +Z (not toggled yet)
+        }
+        self._light_active = {
+            'right': True,
+            'top':   True,
+            'front': True,
+        }
+        # Emissive factor (0..1): 0 = none, 1 = fully self-lit
+        self._emissive = 1.0
+
 
     # -------------------------------------------------------------
     def _build_item(
@@ -171,13 +238,20 @@ class VoxelWidget(QWidget):
         # ---------------------------------------------------------
         color = self._COLOR.get(component, (0.7, 0.7, 0.7, 1.0))
         mesh_data = gl.MeshData(vertexes=verts, faces=faces)
+        # Ensure a valid built-in shader at creation time to avoid KeyError on custom modes
+        current_mode = self._shader_names[self._shader_idx]
+        base_shader = current_mode if current_mode in ("shaded", "balloon", "viewNormalColor", "normalColor") else "shaded"
         item = gl.GLMeshItem(
             meshdata=mesh_data,
-            smooth=False,
+            # smoother shading helps with perceived lighting on curved/surface meshes
+            smooth=True if (mesh is not None or surface_only) else False,
             color=color,
-            shader="shaded",
+            shader=base_shader,
             glOptions="opaque",
         )
+        # Keep references for color-mode switching
+        item._base_color = color
+        item._base_meshdata = mesh_data
         self.gl_view.addItem(item)
 
         # ---------------------------------------------------------
@@ -203,17 +277,36 @@ class VoxelWidget(QWidget):
                 g_verts = green_boxes.vertices.astype(float)
                 g_faces = green_boxes.faces.astype(int)
                 g_data = gl.MeshData(vertexes=g_verts, faces=g_faces)
+                # Use balloon for voxels in viewRed; otherwise a safe built-in shader
+                current_mode = self._shader_names[self._shader_idx]
+                if current_mode == "viewRed":
+                    overlay_shader = "balloon"
+                else:
+                    overlay_shader = current_mode if current_mode in ("shaded", "balloon", "viewNormalColor", "normalColor") else "shaded"
                 green_item = gl.GLMeshItem(
                     meshdata=g_data,
                     smooth=False,
-                    color=(0.0, 1.0, 0.0, 0.25),   # light transparency
-                    shader="shaded",
-                    glOptions="translucent",
+                    color=(0.0, 1.0, 0.0, 0.15),   # brighter, lighter overlay
+                    shader=overlay_shader,
+                    glOptions="translucent",         # vivid, glowing voxels
                 )
+                green_item._base_color = (0.0, 1.0, 0.0, 0.15)
+                green_item._base_meshdata = g_data
                 self.gl_view.addItem(green_item)
                 extra_items = (green_item,)
 
         self._items[component] = (item, *extra_items) if extra_items else item
+        # Reapply colormap/overlay so new/updated items reflect current mode
+        mode = self._shader_names[self._shader_idx]
+        if mode == "viewRed":
+            self._apply_red_normal_coloring_all()
+        elif mode == "normalRed":
+            self._apply_normal_red_coloring_all()
+        elif mode == "shaded":
+            self._apply_brightness_overlay_all(mode)
+        else:
+            # keep built-in appearances (balloon / normalColor / viewNormalColor)
+            self.gl_view.update()
 
         # ---------------------------------------------------------
         # 4) Bounding boxes
@@ -261,6 +354,153 @@ class VoxelWidget(QWidget):
             scene_dist = np.linalg.norm(global_ext) * 1.5
             self.gl_view.setCameraPosition(distance=scene_dist)
             self.gl_view.opts['center'] = Vector(*global_center)
+        
+        if mode == "viewRed":
+            self._apply_red_normal_coloring_all()
+        elif mode == "normalRed":
+            self._apply_normal_red_coloring_all()
+        elif mode == "allRed":            # NEU
+            self._apply_allred_coloring_all()
+        elif mode == "shaded":
+            self._apply_brightness_overlay_all(mode)
+        else:
+            self.gl_view.update()
+
+    # -------------------------------------------------------------
+    # Appearance helpers: apply shader and toggle background
+    # -------------------------------------------------------------
+    
+    def _apply_allred_coloring_all(self):
+        """Uniform, kräftiges Rot nur fürs WORKPIECE-Basismesh."""
+        for comp, obj in list(self._items.items()):
+            if comp is Component.WORKPIECE:
+                target = obj[0] if isinstance(obj, tuple) else obj
+                if target is None:
+                    continue
+                md = getattr(target, "_base_meshdata", None) or target.meshData()
+                target._base_meshdata = md
+                verts = md.vertexes(); faces = md.faces()
+                # Helles Rot: R=1.0, G=B=0.18 (nicht pink, nicht dunkel)
+                alpha = (getattr(target, "_base_color", (1,0.06,0.06,1))[3]
+                        if len(getattr(target, "_base_color", (1,0.06,0.06,1)))==4 else 1.0)
+                r = np.ones((verts.shape[0], 1)); g = np.full((verts.shape[0], 1), 0.18)
+                b = np.full((verts.shape[0], 1), 0.18)
+                a = np.full((verts.shape[0], 1), alpha)
+                vcols = np.hstack([r, g, b, a]).astype(float)
+                colored = gl.MeshData(vertexes=verts, faces=faces, vertexColors=vcols)
+                try: target.setMeshData(meshdata=colored)
+                except TypeError: target.setMeshData(colored)
+        self.gl_view.update()
+    
+    def _apply_shader_all(self):
+        """Apply the currently selected shader and reapply overlays/colormaps."""
+        mode = self._shader_names[self._shader_idx]
+        # Custom red-normal mode: set a base shader, then recolor via vertex colors
+        if mode == "viewRed":
+            # Base meshes use 'shaded' for good lighting; voxel overlay (workpiece) uses 'balloon'
+            for comp, obj in list(self._items.items()):
+                if comp is Component.WORKPIECE and isinstance(obj, tuple) and len(obj) >= 1:
+                    base_item = obj[0]
+                    if hasattr(base_item, "setShader"):
+                        base_item.setShader("shaded")
+                    # If overlay exists, set it to 'balloon' for the desired look
+                    if len(obj) > 1:
+                        overlay_item = obj[1]
+                        if hasattr(overlay_item, "setShader"):
+                            overlay_item.setShader("balloon")
+                else:
+                    # Other components: use shaded as safe base
+                    target_items = obj if isinstance(obj, tuple) else (obj,)
+                    for it in target_items:
+                        if hasattr(it, "setShader"):
+                            it.setShader("shaded")
+            self._apply_red_normal_coloring_all()
+            return
+        elif mode == "allRed":
+            base = "shaded"
+            for comp, obj in list(self._items.items()):
+                if isinstance(obj, tuple):
+                    for it in obj:
+                        if hasattr(it, "setShader"): it.setShader(base)
+                else:
+                    if hasattr(obj, "setShader"): obj.setShader(base)
+            self._apply_allred_coloring_all()
+            return
+        elif mode == "normalRed":
+            base = "shaded"
+            for comp, obj in list(self._items.items()):
+                if isinstance(obj, tuple):
+                    for it in obj:
+                        if hasattr(it, "setShader"):
+                            it.setShader(base)
+                else:
+                    if hasattr(obj, "setShader"):
+                        obj.setShader(base)
+            self._apply_normal_red_coloring_all()
+            return
+
+        # Built-in shaders: apply as-is
+        for comp, obj in list(self._items.items()):
+            if isinstance(obj, tuple):
+                for it in obj:
+                    if hasattr(it, "setShader"):
+                        it.setShader(mode)
+            else:
+                if hasattr(obj, "setShader"):
+                    obj.setShader(mode)
+        # Only apply overlays for shaded; others keep distinct colors
+        if mode == "shaded":
+            self._apply_brightness_overlay_all(mode)
+        else:
+            # Do not overlay for balloon / normalColor / viewNormalColor to keep them distinct
+            self.gl_view.update()
+
+    def _cycle_shader(self):
+        """Cycle through available shaders to change the lighting model."""
+        self._shader_idx = (self._shader_idx + 1) % len(self._shader_names)
+        mode = self._shader_names[self._shader_idx]
+        # Debug print so we can see exactly which mode is active
+        if getattr(self, "_debug_keys", False):
+            try:
+                print(f"[Viewer] Shader mode -> {mode} ({self._shader_idx+1}/{len(self._shader_names)})")
+            except Exception:
+                pass
+        self._apply_shader_all()
+
+    def _cycle_background(self):
+        """Toggle the background color to improve perceived exposure."""
+        self._bg_idx = (self._bg_idx + 1) % len(self._bg_colors)
+        self.gl_view.setBackgroundColor(self._bg_colors[self._bg_idx])
+        # Nudge the view to force a repaint on some GL drivers
+        self.gl_view.opts['elevation'] = self.gl_view.opts.get('elevation', 0)
+        self.gl_view.update()
+
+    def _snapshot_camera(self) -> dict:
+        """Return a dict snapshot of the current GLViewWidget camera state."""
+        opts = self.gl_view.opts
+        center = opts.get('center', Vector(0, 0, 0))
+        return {
+            'distance': float(opts.get('distance', 100.0)),
+            'azimuth': float(opts.get('azimuth', 0.0)),
+            'elevation': float(opts.get('elevation', 0.0)),
+            'fov': float(opts.get('fov', 60.0)),
+            'center': (float(center.x()), float(center.y()), float(center.z())),
+        }
+
+    def _apply_camera(self, cam: dict):
+        """Apply a previously saved camera snapshot to the GL view."""
+        if not cam:
+            return
+        # Order matters: set position first, then center
+        self.gl_view.setCameraPosition(
+            distance=cam.get('distance', self.gl_view.opts.get('distance', 100.0)),
+            azimuth=cam.get('azimuth', self.gl_view.opts.get('azimuth', 0.0)),
+            elevation=cam.get('elevation', self.gl_view.opts.get('elevation', 0.0)),
+        )
+        self.gl_view.opts['fov'] = cam.get('fov', self.gl_view.opts.get('fov', 60.0))
+        cx, cy, cz = cam.get('center', (0.0, 0.0, 0.0))
+        self.gl_view.opts['center'] = Vector(cx, cy, cz)
+        self.gl_view.update()
 
     def update_component(self, component: Component, *,
                          voxgrid=None, mesh=None,
@@ -282,6 +522,39 @@ class VoxelWidget(QWidget):
     # -------------------------------------------------------------
     def keyPressEvent(self, event):
         step = 1.0  # mm per key press; adjust as needed
+        if getattr(self, "_debug_keys", False):
+            try:
+                print(f"KEY evt -> key={event.key()} text={repr(event.text())} mods={int(event.modifiers())}")
+            except Exception:
+                pass
+
+        # Normalize character for robust letter detection (e.g., different layouts)
+        ch = (event.text() or "").lower()
+
+        mods = event.modifiers()
+        ctrl_down = bool(mods & Qt.KeyboardModifier.ControlModifier)
+
+        # Camera hotkeys: Ctrl+P = save, Ctrl+O = restore
+        if ctrl_down and (event.key() == Qt.Key.Key_P or ch == 'p'):
+            self._saved_cam = self._snapshot_camera()
+            event.accept()
+            return
+        if ctrl_down and (event.key() == Qt.Key.Key_O or ch == 'o'):
+            if self._saved_cam is not None:
+                self._apply_camera(self._saved_cam)
+            event.accept()
+            return
+
+
+        # Appearance hotkeys: L = cycle shader, B = toggle background
+        if event.key() == Qt.Key.Key_L or ch == 'l':
+            self._cycle_shader()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_B or ch == 'b':
+            self._cycle_background()
+            event.accept()
+            return
 
         key_map = {
             Qt.Key.Key_A: (-step, 0.0, 0.0),   # left  (X-)
@@ -308,15 +581,273 @@ class VoxelWidget(QWidget):
                 self.toolMoved.emit(self.tool_pos.copy())
             self.gl_view.update()
             event.accept()
-        else:
-            super().keyPressEvent(event)
+            return
+        # Not handled here -> ignore so parent/Qt can process
+        event.ignore()
+        return
 
     # -------------------------------------------------------------
-    # Forward key events from the inner GLViewWidget to keyPressEvent
+    # Forward key events from the inner GLViewWidget to keyPressEvent,
+    # and handle ShortcutOverride to catch hotkeys before Qt grabs them.
+    # Prevent double-triggering of hotkeys by only acting on KeyPress.
     # -------------------------------------------------------------
     def eventFilter(self, obj, event):
         from PyQt6.QtCore import QEvent
-        if obj is self.gl_view and event.type() == QEvent.Type.KeyPress:
-            self.keyPressEvent(event)
-            return True  # event handled
+        # Ensure the GL view keeps focus when the mouse enters it
+        if obj is self.gl_view and event.type() == QEvent.Type.Enter:
+            self.gl_view.setFocus()
+            return False
+
+        # Intercept ShortcutOverride to reserve our hotkeys, but do NOT execute actions here
+        if obj is self.gl_view:
+            if event.type() == QEvent.Type.ShortcutOverride:
+                # Reserve keys we handle so no other shortcut steals them
+                key = getattr(event, 'key', lambda: None)()
+                if key in (
+                    Qt.Key.Key_L, Qt.Key.Key_B,
+                    Qt.Key.Key_P, Qt.Key.Key_O,
+                    Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D,
+                    Qt.Key.Key_Q, Qt.Key.Key_E,
+                ):
+                    event.accept()
+                    return True  # consume only the override; real action on KeyPress
+                return False
+
+            if event.type() == QEvent.Type.KeyPress:
+                # Execute our actions exactly once per physical key press
+                self.keyPressEvent(event)
+                if event.isAccepted():
+                    return True
+                return False
+
         return super().eventFilter(obj, event)
+    # ------------------ Color/normal helpers ------------------
+    @staticmethod
+    def _compute_vertex_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+        """Compute per-vertex unit normals from vertices/faces."""
+        v = verts
+        f = faces.astype(int)
+        # face normals
+        p0 = v[f[:, 0]]
+        p1 = v[f[:, 1]]
+        p2 = v[f[:, 2]]
+        fn = np.cross(p1 - p0, p2 - p0)
+        # avoid zero-length
+        fn_len = np.linalg.norm(fn, axis=1) + 1e-12
+        fn = fn / fn_len[:, None]
+        # accumulate to vertices
+        vn = np.zeros_like(v)
+        for i in range(3):
+            np.add.at(vn, f[:, i], fn)
+        # normalize
+        l = np.linalg.norm(vn, axis=1) + 1e-12
+        vn = vn / l[:, None]
+        return vn
+
+    def _apply_brightness_overlay_to_item(self, item: gl.GLMeshItem, mode: str):
+        """Apply a per-vertex brightness overlay based on multiple lights
+        and emissive term. Works with all shaders; if a shader ignores
+        vertex colors (e.g., normalColor), the effect may be limited."""
+        md = getattr(item, "_base_meshdata", None)
+        base_color = getattr(item, "_base_color", (0.7, 0.7, 0.7, 1.0))
+        if md is None:
+            md = item.meshData()
+            item._base_meshdata = md
+        verts = md.vertexes()
+        faces = md.faces()
+        vn = self._compute_vertex_normals(verts, faces)
+        # Compute brightness from all active lights (directional)
+        intensity = np.zeros(verts.shape[0], dtype=float)
+        for lname, ldir in self._light_dirs.items():
+            if self._light_active.get(lname, False):
+                lambert = np.clip(vn @ ldir, 0.0, 1.0)
+                intensity += lambert
+        # Clamp combined light to [0,1] for a stronger, visible toggle effect
+        intensity = np.clip(intensity, 0.0, 1.0)
+        # Add emissive/self-illumination
+        emissive = getattr(self, "_emissive", 0.0)
+        intensity = (1.0 - emissive) * intensity + emissive * 1.0
+        # Gamma
+        gamma = float(getattr(self, "_cm_gamma", 0.75))
+        intensity = np.power(intensity, gamma)
+        # Ambient fill
+        ambient = float(getattr(self, "_cm_ambient", 0.30))
+        intensity = np.clip(ambient + (1.0 - ambient) * intensity, 0.0, 1.0)
+        base_rgba = np.array(base_color, dtype=float)
+        rgb = (base_rgba[None, :3]) * intensity[:, None]
+        rgb = np.clip(rgb, 0.0, 1.0)
+        a = np.full((verts.shape[0], 1), base_rgba[3] if len(base_rgba) == 4 else 1.0)
+        vcols = np.hstack([rgb, a]).astype(float)
+        # Create a meshdata with vertex colors but same topology
+        colored = gl.MeshData(vertexes=verts, faces=faces, vertexColors=vcols)
+        try:
+            item.setMeshData(meshdata=colored)
+        except TypeError:
+            item.setMeshData(colored)
+
+        # --- Fallback: also set a uniform color scaled by mean intensity ---
+        # Some pyqtgraph shaders (or versions) may prioritize uniform color.
+        # Setting it here guarantees a visible effect even if vertex colors
+        # are ignored by the shader.
+        mean_int = float(np.mean(intensity))
+        base_rgba = np.array(base_color, dtype=float)
+        uni_rgb = np.clip(base_rgba[:3] * mean_int, 0.0, 1.0)
+        item.setColor((float(uni_rgb[0]), float(uni_rgb[1]), float(uni_rgb[2]), float(base_rgba[3] if len(base_rgba)==4 else 1.0)))
+
+
+
+    def _apply_red_normal_coloring_to_item(self, item: gl.GLMeshItem):
+        """Apply a red-only variant of normal-based coloring using vertex colors.
+        Enhanced contrast for contour/shadow while keeping strong red appearance.
+        """
+        md = getattr(item, "_base_meshdata", None)
+        base_color = getattr(item, "_base_color", (1.0, 0.06, 0.06, 1.0))
+        if md is None:
+            md = item.meshData()
+            item._base_meshdata = md
+        verts = md.vertexes()
+        faces = md.faces()
+        vn = self._compute_vertex_normals(verts, faces)
+
+        # --- Enhanced shading for red mode (brighter) ---
+        # Directional lights (sum), view-facing term, and rim highlight
+        intensity_l = np.zeros(verts.shape[0], dtype=float)
+        for lname, ldir in self._light_dirs.items():
+            if self._light_active.get(lname, False):
+                lam = np.clip(vn @ ldir, 0.0, 1.0)
+                intensity_l += lam
+        intensity_l = np.clip(intensity_l, 0.0, 1.0)
+
+        view_f = 0.5 * (vn[:, 2] + 1.0)
+        rim = np.power(1.0 - view_f, 2.0)
+
+        # Brighter local tone mapping: higher ambient, mild gamma
+        ambient_local = 0.22
+        gamma_local = 1.05
+        intensity = 0.85 * intensity_l + 0.15 * view_f + 0.20 * rim
+        intensity = np.clip(intensity, 0.0, 1.0)
+        intensity = ambient_local + (1.0 - ambient_local) * intensity
+        intensity = np.power(intensity, gamma_local)
+
+        # Red mapping: strong red with brighter GB to retain shape
+        r = np.ones_like(intensity)
+        gb = np.clip(0.20 + 0.65 * intensity, 0.0, 1.0)
+        g = gb
+        b = gb
+        # Build RGB then apply saturation blend towards white to reduce intensity
+        rgb = np.column_stack([r, g, b]).astype(float)
+        sat = float(getattr(self, "_viewred_saturation", 1.0))
+        if sat < 1.0:
+            rgb = sat * rgb + (1.0 - sat) * 1.0  # blend towards white
+        rgb = np.clip(rgb, 0.0, 1.0)
+        a = np.full((rgb.shape[0], 1), base_color[3] if len(base_color) == 4 else 1.0)
+        vcols = np.hstack([rgb, a]).astype(float)
+
+        colored = gl.MeshData(vertexes=verts, faces=faces, vertexColors=vcols)
+        try:
+            item.setMeshData(meshdata=colored)
+        except TypeError:
+            item.setMeshData(colored)
+
+    def _apply_red_normal_coloring_all(self):
+        for comp, obj in list(self._items.items()):
+            if comp is Component.WORKPIECE:
+                if isinstance(obj, tuple) and len(obj) >= 1:
+                    it = obj[0]  # base workpiece mesh
+                    if not hasattr(it, "_base_meshdata"):
+                        it._base_meshdata = it.meshData()
+                    if not hasattr(it, "_base_color"):
+                        it._base_color = getattr(it, "opts", {}).get("color", (1,1,1,1)) if hasattr(it, "opts") else (1,1,1,1)
+                    self._apply_red_normal_coloring_to_item(it)
+                elif not isinstance(obj, tuple):
+                    it = obj
+                    if not hasattr(it, "_base_meshdata"):
+                        it._base_meshdata = it.meshData()
+                    if not hasattr(it, "_base_color"):
+                        it._base_color = getattr(it, "opts", {}).get("color", (1,1,1,1)) if hasattr(it, "opts") else (1,1,1,1)
+                    self._apply_red_normal_coloring_to_item(it)
+        self.gl_view.update()
+
+    def _apply_normal_red_coloring_to_item(self, item: gl.GLMeshItem):
+        """Blend between normalColor-style RGB and our red-normal coloring.
+        Gives red-dominant look but retains contour/specular-like variety.
+        """
+        md = getattr(item, "_base_meshdata", None)
+        base_color = getattr(item, "_base_color", (1.0, 0.06, 0.06, 1.0))
+        if md is None:
+            md = item.meshData()
+            item._base_meshdata = md
+        verts = md.vertexes()
+        faces = md.faces()
+        vn = self._compute_vertex_normals(verts, faces)
+
+        # --- normalColor-like mapping (object-space normals to RGB 0..1)
+        nc_rgb = (vn * 0.5) + 0.5
+        nc_rgb = np.clip(nc_rgb, 0.0, 1.0)
+
+        # --- red-normal mapping (brighter, closer to viewRed, with rim lift)
+        view_f = 0.5 * (vn[:, 2] + 1.0)
+        view_f = np.power(view_f, 0.80)
+        gb = np.clip(0.18 + 0.75 * view_f, 0.0, 1.0)
+        red_rgb = np.column_stack([np.ones_like(gb), gb, gb])
+
+        # --- blend (lean more towards red), then rim-lift contours
+        a = float(getattr(self, "_mix_normal_red_alpha", 0.75))
+        rgb = a * red_rgb + (1.0 - a) * nc_rgb
+
+        # Rim term brightens silhouette a bit to avoid flat areas
+        rim = np.power(1.0 - view_f, 2.0)
+        rgb = np.clip(rgb + 0.12 * rim[:, None], 0.0, 1.0)
+
+        # local tone curve for brightness/contrast
+        amb = float(getattr(self, "_mix_normal_red_ambient", 0.28))
+        gam = float(getattr(self, "_mix_normal_red_gamma", 0.85))
+        rgb = amb + (1.0 - amb) * rgb
+        rgb = np.power(rgb, gam)
+        rgb = np.clip(rgb, 0.0, 1.0)
+
+        alpha = base_color[3] if len(base_color) == 4 else 1.0
+        vcols = np.column_stack([rgb, np.full((rgb.shape[0], 1), alpha)])
+        colored = gl.MeshData(vertexes=verts, faces=faces, vertexColors=vcols)
+        try:
+            item.setMeshData(meshdata=colored)
+        except TypeError:
+            item.setMeshData(colored)
+
+    def _apply_normal_red_coloring_all(self):
+        for comp, obj in list(self._items.items()):
+            if comp is Component.WORKPIECE:
+                if isinstance(obj, tuple) and len(obj) >= 1:
+                    it = obj[0]
+                    if not hasattr(it, "_base_meshdata"):
+                        it._base_meshdata = it.meshData()
+                    if not hasattr(it, "_base_color"):
+                        it._base_color = getattr(it, "opts", {}).get("color", (1,1,1,1)) if hasattr(it, "opts") else (1,1,1,1)
+                    self._apply_normal_red_coloring_to_item(it)
+                elif not isinstance(obj, tuple):
+                    it = obj
+                    if not hasattr(it, "_base_meshdata"):
+                        it._base_meshdata = it.meshData()
+                    if not hasattr(it, "_base_color"):
+                        it._base_color = getattr(it, "opts", {}).get("color", (1,1,1,1)) if hasattr(it, "opts") else (1,1,1,1)
+                    self._apply_normal_red_coloring_to_item(it)
+        self.gl_view.update()
+
+    def _apply_brightness_overlay_all(self, mode: str):
+        # Apply brightness overlay to all items
+        for comp, obj in list(self._items.items()):
+            if isinstance(obj, tuple):
+                for it in obj:
+                    if not hasattr(it, "_base_meshdata"):
+                        it._base_meshdata = it.meshData()
+                    if not hasattr(it, "_base_color"):
+                        it._base_color = getattr(it, "opts", {}).get("color", (1,1,1,1)) if hasattr(it, "opts") else (1,1,1,1)
+                    self._apply_brightness_overlay_to_item(it, mode)
+            else:
+                it = obj
+                if not hasattr(it, "_base_meshdata"):
+                    it._base_meshdata = it.meshData()
+                if not hasattr(it, "_base_color"):
+                    it._base_color = getattr(it, "opts", {}).get("color", (1,1,1,1)) if hasattr(it, "opts") else (1,1,1,1)
+                self._apply_brightness_overlay_to_item(it, mode)
+        self.gl_view.update()

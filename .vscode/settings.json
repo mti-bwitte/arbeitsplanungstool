@@ -1,3 +1,17 @@
 {
-    "git.ignoreLimitWarning": true
+    "git.ignoreLimitWarning": true,
+
+    "emeraldwalk.runonsave": {
+        "commands": [
+            {
+                "match": ".*\\.py$",
+                "cmd": "/bin/zsh -lc 'cd ${workspaceFolder} && source .venv/bin/activate && python -m pylint.pyreverse -o svg -p arbeitsplanungstool -d diagrams src/arbeitsplaner'"
+            }
+        ]
+    },
+
+    // "workbench.editor.enablePreview": true
+
+    "python.linting.enabled": false,
+    "python.linting.pylintEnabled": false
 }

@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QToolBar, QPushButton, QDoubleSpinBox,
     QLabel, QComboBox, QToolButton
 )
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
 import time
 import numpy as np
 
@@ -158,6 +158,12 @@ class MainWindow(QMainWindow):
             # first time: create an empty viewer (no heavy preprocessing)
             self._viewer = VoxelWidget(None)
             self.setCentralWidget(self._viewer)
+            # Ensure viewer gets focus so key events land there
+            self._viewer.setFocus()
+            try:
+                self._viewer.gl_view.setFocus()
+            except AttributeError:
+                pass
             if not hasattr(self, "_tool_sig_connected"):
                 self._viewer.toolMoved.connect(self._on_tool_moved)
                 self._tool_sig_connected = True
@@ -201,6 +207,12 @@ class MainWindow(QMainWindow):
         if self._viewer is None:
             self._viewer = VoxelWidget(vg, surface_only=True)
             self.setCentralWidget(self._viewer)
+            # Ensure viewer gets focus so key events land there
+            self._viewer.setFocus()
+            try:
+                self._viewer.gl_view.setFocus()
+            except AttributeError:
+                pass
 
         self._viewer.update_component(comp, voxgrid=vg, surface_only=True)
 
@@ -228,6 +240,12 @@ class MainWindow(QMainWindow):
         if self._viewer is None:
             self._viewer = VoxelWidget(voxgrid, surface_only=True)
             self.setCentralWidget(self._viewer)
+            # Ensure viewer gets focus so key events land there
+            self._viewer.setFocus()
+            try:
+                self._viewer.gl_view.setFocus()
+            except AttributeError:
+                pass
 
         self._viewer.update_component(
             Component.WORKPIECE,
@@ -325,3 +343,15 @@ class MainWindow(QMainWindow):
 
         self.voxel_shown_label.setText(f"Voxels shown: {shown:,}")
         self.voxel_mill_label.setText(f"Voxels to mill: {to_mill_remaining:,}")
+
+    def keyPressEvent(self, event):
+        """
+        Forward key presses to the central VoxelWidget so its Qt key events
+        (e.g., L/B for lighting & background, WASD/QE for tool movement)
+        work even if the main window currently has focus.
+        """
+        if self._viewer is not None:
+            self._viewer.keyPressEvent(event)
+            if event.isAccepted():
+                return
+        super().keyPressEvent(event)
